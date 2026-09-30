@@ -2,8 +2,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { form, getRequestEvent } from '$app/server';
 import { error, invalid, redirect } from '@sveltejs/kit';
 import { LOGIN_REDIRECT } from '#lib/config.svelte.ts';
-import { AUTH_CODE_MAX_ATTEMPTS } from '#lib/config.ts';
-import { loginAttemptTable } from '#lib/database/schema.ts';
+import { ALLOW_UNREGISTERED, AUTH_CODE_MAX_ATTEMPTS } from '#lib/config.ts';
+import { loginAttemptTable, userTable } from '#lib/database/schema.ts';
 import { getRedirectUrl } from '#lib/server/auth/redirect.ts';
 import { requireLoggedOut } from '#lib/server/auth/session.ts';
 import { issueToken } from '#lib/server/auth/token.ts';
@@ -20,12 +20,11 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 		(tx) => {
 			const login = tx.query.loginTable
 				.findFirst({
-					where: { id: data.id },
+					where: { id: data.id, contact: data.contact },
 					columns: { code: true, expiresAt: true, ip: true },
 					with: {
 						attempts: { columns: { isSuccessful: true } },
 						activeUser: {
-							where: { contact: data.contact },
 							columns: { id: true },
 							with: {
 								profile: { columns: { id: true } },
@@ -36,7 +35,7 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 				})
 				.sync();
 
-			if (!login || !login.activeUser) error(400);
+			if (!login) error(400);
 
 			if (login.ip !== ip) {
 				return { success: false, code: 'IP_MISMATCH' } as const;
@@ -53,10 +52,12 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 				return { success: false, code: 'CODE_BLOCKED' } as const;
 			}
 
-			const isCorrect = timingSafeEqual(
-				Buffer.from(login.code), //
-				Buffer.from(data.code),
-			);
+			const isCorrect =
+				timingSafeEqual(
+					Buffer.from(login.code), //
+					Buffer.from(data.code),
+				) &&
+				(!!login.activeUser || ALLOW_UNREGISTERED);
 
 			tx.insert(loginAttemptTable)
 				.values({
@@ -68,7 +69,17 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 
 			if (!isCorrect) return { success: false, code: 'CODE_INVALID' } as const;
 
-			return { success: true, user: login.activeUser } as const;
+			const user = login.activeUser ?? {
+				id: tx
+					.insert(userTable)
+					.values({ contact: data.contact })
+					.returning({ id: userTable.id })
+					.all()[0]!.id,
+				profile: null,
+				activeRoles: [],
+			};
+
+			return { success: true, user } as const;
 		},
 		{ behavior: 'immediate' },
 	);
