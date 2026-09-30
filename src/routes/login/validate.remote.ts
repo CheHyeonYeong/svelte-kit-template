@@ -1,9 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import { form, getRequestEvent } from '$app/server';
 import { error, invalid, redirect } from '@sveltejs/kit';
+import { eq } from 'drizzle-orm';
 import { LOGIN_REDIRECT } from '#lib/config.svelte.ts';
-import { ALLOW_UNREGISTERED, AUTH_CODE_MAX_ATTEMPTS } from '#lib/config.ts';
-import { loginAttemptTable, userTable } from '#lib/database/schema.ts';
+import { AUTH_CODE_MAX_ATTEMPTS } from '#lib/config.ts';
+import { loginAttemptTable, loginTable, userTable } from '#lib/database/schema.ts';
+import type { UserRole } from '#lib/enums/user.ts';
 import { getRedirectUrl } from '#lib/server/auth/redirect.ts';
 import { requireLoggedOut } from '#lib/server/auth/session.ts';
 import { issueToken } from '#lib/server/auth/token.ts';
@@ -21,7 +23,7 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 			const login = tx.query.loginTable
 				.findFirst({
 					where: { id: data.id, contact: data.contact },
-					columns: { code: true, expiresAt: true, ip: true },
+					columns: { sendId: true, userId: true, code: true, expiresAt: true, ip: true },
 					with: {
 						attempts: { columns: { isSuccessful: true } },
 						activeUser: {
@@ -35,7 +37,7 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 				})
 				.sync();
 
-			if (!login) error(400);
+			if (!login || (login.userId && !login.activeUser)) error(400);
 
 			if (login.ip !== ip) {
 				return { success: false, code: 'IP_MISMATCH' } as const;
@@ -53,11 +55,11 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 			}
 
 			const isCorrect =
+				!!login.sendId &&
 				timingSafeEqual(
 					Buffer.from(login.code), //
 					Buffer.from(data.code),
-				) &&
-				(!!login.activeUser || ALLOW_UNREGISTERED);
+				);
 
 			tx.insert(loginAttemptTable)
 				.values({
@@ -69,17 +71,28 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 
 			if (!isCorrect) return { success: false, code: 'CODE_INVALID' } as const;
 
-			const user = login.activeUser ?? {
-				id: tx
-					.insert(userTable)
-					.values({ contact: data.contact })
-					.returning({ id: userTable.id })
-					.all()[0]!.id,
-				profile: null,
-				activeRoles: [],
-			};
+			if (login.activeUser) {
+				const token = {
+					sub: login.activeUser.id,
+					roles: new Set(login.activeUser.activeRoles.map((row) => row.role)),
+					profile: !!login.activeUser.profile,
+				};
+				return { success: true, token } as const;
+			}
 
-			return { success: true, user } as const;
+			const user = tx
+				.insert(userTable)
+				.values({ contact: data.contact })
+				.onConflictDoNothing()
+				.returning({ id: userTable.id })
+				.all()[0];
+
+			if (!user) error(400);
+
+			tx.update(loginTable).set({ userId: user.id }).where(eq(loginTable.id, data.id)).run();
+
+			const token = { sub: user.id, roles: new Set<UserRole>(), profile: false };
+			return { success: true, token } as const;
 		},
 		{ behavior: 'immediate' },
 	);
@@ -89,11 +102,7 @@ export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 		return result;
 	}
 
-	await issueToken({
-		sub: result.user.id,
-		roles: new Set(result.user.activeRoles.map((row) => row.role)),
-		profile: !!result.user.profile,
-	});
+	await issueToken(result.token);
 
 	redirect(303, getRedirectUrl() || LOGIN_REDIRECT);
 });
