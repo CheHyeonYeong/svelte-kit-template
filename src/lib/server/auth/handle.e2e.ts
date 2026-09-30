@@ -3,7 +3,7 @@ import { type BrowserContext, expect } from '@playwright/test';
 import { type JWTPayload, SignJWT, UnsecuredJWT } from 'jose';
 import { JWT_SECRET_NEW, JWT_SECRET_OLD } from '#cli/e2e/env.ts';
 import { test } from '#cli/e2e/fixtures.ts';
-import { seedToken, seedUser } from '#cli/lib/database/app.testing.ts';
+import { type createDb, seedToken, seedUser } from '#cli/lib/database/app.testing.ts';
 import {
 	AUTH_COOKIE_NAME,
 	AUTH_TOKEN_ALGORITHM,
@@ -12,9 +12,7 @@ import {
 } from '#lib/config.ts';
 import { userProfileTable } from '#lib/database/schema.ts';
 
-type Db = Parameters<typeof seedUser>[0];
-
-const seedSession = (db: Db, expiresAt: number) => {
+const seedSession = (db: ReturnType<typeof createDb>, expiresAt: number) => {
 	const userId = seedUser(db);
 	db.insert(userProfileTable).values({ id: userId, birth: '2000-01-01' }).run();
 
