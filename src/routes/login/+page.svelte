@@ -4,6 +4,7 @@
 	import StyledLabels from '#lib/components/StyledLabels.svelte';
 	import { AUTH_CODE_LENGTH } from '#lib/config.ts';
 	import { PLACEHOLDER_EMAIL } from '#lib/placeholders.ts';
+	import { EMAIL_MAX_LENGTH } from '#lib/valibot.ts';
 	import { sendCode as _sendCode } from './send.remote.ts';
 	import { SendCodeSchema } from './send.ts';
 	import { CODE_BLOCKED, CODE_EXPIRED, IP_MISMATCH } from './shared.ts';
@@ -60,6 +61,7 @@
 								{...sendCode.fields.contact.as('email')}
 								autocomplete="email"
 								autofocus
+								maxlength={EMAIL_MAX_LENGTH}
 								placeholder={PLACEHOLDER_EMAIL}
 							/>
 							{@render formIssues(sendCode.fields.contact.issues())}

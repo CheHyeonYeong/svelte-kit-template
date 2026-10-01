@@ -1,9 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import { form, getRequestEvent } from '$app/server';
 import { error, invalid, redirect } from '@sveltejs/kit';
+import { eq } from 'drizzle-orm';
 import { LOGIN_REDIRECT } from '#lib/config.svelte.ts';
 import { AUTH_CODE_MAX_ATTEMPTS } from '#lib/config.ts';
-import { loginAttemptTable } from '#lib/database/schema.ts';
+import { loginAttemptTable, loginTable, userTable } from '#lib/database/schema.ts';
+import type { UserRole } from '#lib/enums/user.ts';
 import { getRedirectUrl } from '#lib/server/auth/redirect.ts';
 import { requireLoggedOut } from '#lib/server/auth/session.ts';
 import { issueToken } from '#lib/server/auth/token.ts';
@@ -14,61 +16,93 @@ import { ValidateCodeSchema } from './validate.ts';
 export const validateCode = form(ValidateCodeSchema, async (data, issue) => {
 	requireLoggedOut();
 
-	const login = db.query.loginTable
-		.findFirst({
-			where: { id: data.id },
-			columns: { code: true, expiresAt: true, ip: true },
-			with: {
-				attempts: { columns: { id: true } },
-				activeUser: {
-					where: { contact: data.contact },
-					columns: { id: true },
+	const ip = getRequestEvent().getClientAddress();
+
+	const result = db.transaction(
+		(tx) => {
+			const login = tx.query.loginTable
+				.findFirst({
+					where: { id: data.id, contact: data.contact },
+					columns: { sendId: true, userId: true, code: true, expiresAt: true, ip: true },
 					with: {
-						profile: { columns: { id: true } },
-						activeRoles: { columns: { role: true } },
+						attempts: { columns: { isSuccessful: true } },
+						activeUser: {
+							columns: { id: true },
+							with: {
+								profile: { columns: { id: true } },
+								activeRoles: { columns: { role: true } },
+							},
+						},
 					},
-				},
-			},
-		})
-		.sync();
+				})
+				.sync();
 
-	if (!login || !login.activeUser) error(400);
+			if (!login || (login.userId && !login.activeUser)) error(400);
 
-	const event = getRequestEvent();
-	const ip = event.getClientAddress();
+			if (login.ip !== ip) {
+				return { success: false, code: 'IP_MISMATCH' } as const;
+			}
 
-	if (login.ip !== ip) {
-		return { success: false, code: 'IP_MISMATCH' } as const;
-	}
+			if (login.expiresAt < new Date()) {
+				return { success: false, code: 'CODE_EXPIRED' } as const;
+			}
 
-	if (login.expiresAt < new Date()) {
-		return { success: false, code: 'CODE_EXPIRED' } as const;
-	}
+			if (
+				login.attempts.length >= AUTH_CODE_MAX_ATTEMPTS ||
+				login.attempts.some((attempt) => attempt.isSuccessful)
+			) {
+				return { success: false, code: 'CODE_BLOCKED' } as const;
+			}
 
-	if (login.attempts.length >= AUTH_CODE_MAX_ATTEMPTS) {
-		return { success: false, code: 'CODE_BLOCKED' } as const;
-	}
+			const isCorrect =
+				!!login.sendId &&
+				timingSafeEqual(
+					Buffer.from(login.code), //
+					Buffer.from(data.code),
+				);
 
-	const isCorrect = timingSafeEqual(
-		Buffer.from(login.code), //
-		Buffer.from(data.code),
+			tx.insert(loginAttemptTable)
+				.values({
+					loginId: data.id,
+					isSuccessful: isCorrect,
+					ip,
+				})
+				.run();
+
+			if (!isCorrect) return { success: false, code: 'CODE_INVALID' } as const;
+
+			if (login.activeUser) {
+				const token = {
+					sub: login.activeUser.id,
+					roles: new Set(login.activeUser.activeRoles.map((row) => row.role)),
+					profile: !!login.activeUser.profile,
+				};
+				return { success: true, token } as const;
+			}
+
+			const user = tx
+				.insert(userTable)
+				.values({ contact: data.contact })
+				.onConflictDoNothing()
+				.returning({ id: userTable.id })
+				.all()[0];
+
+			if (!user) error(400);
+
+			tx.update(loginTable).set({ userId: user.id }).where(eq(loginTable.id, data.id)).run();
+
+			const token = { sub: user.id, roles: new Set<UserRole>(), profile: false };
+			return { success: true, token } as const;
+		},
+		{ behavior: 'immediate' },
 	);
 
-	db.insert(loginAttemptTable)
-		.values({
-			loginId: data.id,
-			isSuccessful: isCorrect,
-			ip,
-		})
-		.run();
+	if (!result.success) {
+		if (result.code === 'CODE_INVALID') invalid(issue.code(CODE_INVALID));
+		return result;
+	}
 
-	if (!isCorrect) invalid(issue.code(CODE_INVALID));
-
-	await issueToken({
-		sub: login.activeUser.id,
-		roles: new Set(login.activeUser.activeRoles.map((row) => row.role)),
-		profile: !!login.activeUser.profile,
-	});
+	await issueToken(result.token);
 
 	redirect(303, getRedirectUrl() || LOGIN_REDIRECT);
 });

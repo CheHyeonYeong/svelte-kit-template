@@ -1,7 +1,9 @@
-import { email, isoDate, pipe, string, transform } from 'valibot';
+import { email, isoDate, maxLength, pipe, string, transform } from 'valibot';
 import type { ISODateString } from './types.ts';
 
-export const EmailSchema = pipe(string(), email());
+export const EMAIL_MAX_LENGTH = 254;
+
+export const EmailSchema = pipe(string(), maxLength(EMAIL_MAX_LENGTH), email());
 
 export const ISODateSchema = pipe(
 	string(),
